@@ -161,41 +161,63 @@ def open_home_via_avatar(page: Page) -> None:
 
 
 def open_first_pending_class(page: Page, visited_classes: set[str]) -> bool:
-    """在当前页面查找一个未处理班级并进入。"""
-    log("查找需要学习的班级...")
+    """从“任务日历”区域优先进入班级（你截图里的班级任务入口）。"""
+    log("查找任务日历中的班级入口...")
 
-    # 常见入口：我的任务/班级列表
-    click_if_visible(page, ["text=我的任务", "text=班级", "text=学习中心"], timeout=800)
-    page.wait_for_timeout(800)
+    page.goto(CENTER_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1000)
+    click_if_visible(page, ["text=我的任务"], timeout=1000)
+    page.wait_for_timeout(900)
 
-    class_nodes = page.locator("div,li,section,article,a").filter(has_text=re.compile(r"班"))
-    count = class_nodes.count()
-    for i in range(min(count, 120)):
-        node = class_nodes.nth(i)
+    # 方案1：优先点击任务行右侧“全天”（截图中可点入口）
+    day_links = page.locator("a:has-text('全天'), span:has-text('全天')")
+    day_count = day_links.count()
+    for i in range(min(day_count, 8)):
+        try:
+            before = page.url
+            day_links.nth(i).click(timeout=1200)
+            page.wait_for_timeout(1500)
+            body = safe_text(page.locator("body").inner_text())
+            if page.url != before or any(x in body for x in ("在线课程", "未完成", "已完成", "进度")):
+                visited_classes.add(f"DAYLINK::{page.url}")
+                log("已从任务日历进入班级课程页（全天入口）。")
+                return True
+        except Exception:
+            continue
+
+    # 方案2：点击任务日历里“班 ...”任务标题（避免匹配整页大容器）
+    title_nodes = page.locator("a,span,p,li,em,strong").filter(has_text=re.compile(r"^\s*班|班级|培训班"))
+    title_count = title_nodes.count()
+    for i in range(min(title_count, 80)):
+        node = title_nodes.nth(i)
         text = safe_text(node.inner_text())
-        if len(text) < 4:
+        if len(text) < 3 or len(text) > 80:
             continue
         key = text.replace("\n", " ")[:80]
         if key in visited_classes:
             continue
-        if not any(x in text for x in ("班", "课程", "任务")):
-            continue
 
-        for sel in [None, "a", "button", ".title", ".name"]:
-            try:
-                target = node if sel is None else node.locator(sel).first
-                target.click(timeout=1200)
-                page.wait_for_load_state("domcontentloaded")
-                page.wait_for_timeout(1500)
+        try:
+            before = page.url
+            node.click(timeout=1200)
+            page.wait_for_timeout(1500)
+            body = safe_text(page.locator("body").inner_text())
+            if page.url != before or any(x in body for x in ("在线课程", "未完成", "已完成", "进度")):
                 visited_classes.add(key)
                 log(f"进入班级：{key}")
                 return True
-            except Exception:
-                continue
+        except Exception:
+            continue
 
-    # 找不到班级时尝试直接进入学习中心（某些账号只有一个班级）
-    page.goto(CENTER_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(1000)
+    # 方案3：头像菜单中的“班级”快捷入口
+    if click_if_visible(page, ["[class*='avatar']", ".el-avatar", "img[src*='avatar']", "[class*='user']"], timeout=1000):
+        page.wait_for_timeout(700)
+        if click_if_visible(page, ["text=班级", "a:has-text('班级')"], timeout=1200):
+            page.wait_for_timeout(1200)
+            log("通过头像菜单进入班级。")
+            return True
+
+    log("未找到可进入的任务日历班级入口。")
     return False
 
 
