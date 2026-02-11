@@ -2,15 +2,11 @@
 """
 仅用于自动化测试示例：
 - 默认使用 Edge 浏览器启动（如不可用会回退到 Chromium）
-- 打开中国烟草网络学院并等待用户扫码登录
-- 登录后进入“个人中心-学习中心”页面
-- 自动查找未完成课程并进入
-- 在课程目录里自动播放视频类小节
+- 自动点击“登录”，切换“微信登录”，等待微信扫码
+- 登录后自动点击头像进入个人主页/学习中心
+- 自动查找需要学习的班级并进入
+- 每个班级下自动翻页（每页约 4 门）查找未完成课程并学习
 - 识别到答题/测验类小节时直接跳过
-
-依赖：pip install playwright
-首次使用：python -m playwright install chromium
-运行：python auto_course.py
 """
 
 from __future__ import annotations
@@ -32,10 +28,11 @@ VIDEO_KEYWORDS = ("视频", "学习", "播放")
 @dataclass
 class Config:
     headless: bool = False
-    browser_channel: str = "msedge"  # 默认 Edge
+    browser_channel: str = "msedge"
     settle_wait_sec: float = 2.0
     watch_poll_sec: float = 8.0
     lesson_timeout_sec: int = 90 * 60
+    login_timeout_sec: int = 12 * 60
 
 
 def log(msg: str) -> None:
@@ -52,7 +49,6 @@ def contains_keywords(text: str, keywords: tuple[str, ...]) -> bool:
 
 
 def launch_browser(playwright: Playwright, cfg: Config) -> Browser:
-    """默认 Edge，失败时回退 Chromium。"""
     try:
         log("尝试使用 Edge 启动浏览器...")
         return playwright.chromium.launch(headless=cfg.headless, channel=cfg.browser_channel)
@@ -61,117 +57,229 @@ def launch_browser(playwright: Playwright, cfg: Config) -> Browser:
         return playwright.chromium.launch(headless=cfg.headless)
 
 
-def wait_for_scan_login(page: Page) -> None:
-    log("打开首页，等待扫码登录...")
-    page.goto(HOME_URL, wait_until="domcontentloaded")
+def click_if_visible(page: Page, selectors: list[str], timeout: int = 1200) -> bool:
+    for sel in selectors:
+        try:
+            page.locator(sel).first.click(timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
 
-    deadline = time.time() + 10 * 60
+
+def ensure_login_page_and_wechat_tab(page: Page) -> None:
+    """自动点击登录，并切到微信登录区域。"""
+    log("进入首页并尝试点击登录...")
+    page.goto(HOME_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1200)
+
+    # 已登录则无需点登录
+    try:
+        if page.locator("[class*='avatar'], [class*='user'], .el-avatar").first.is_visible(timeout=800):
+            log("已是登录态，跳过登录按钮点击。")
+            return
+    except Exception:
+        pass
+
+    clicked = click_if_visible(page, ["text=登录", "a:has-text('登录')", "button:has-text('登录')"])
+    if clicked:
+        log("已点击登录按钮。")
+        page.wait_for_timeout(1500)
+
+    # 切换到微信登录（有些页面本来就默认展示）
+    if click_if_visible(page, ["text=微信登录", "a:has-text('微信登录')", "button:has-text('微信登录')"], timeout=1000):
+        log("已点击微信登录。")
+        page.wait_for_timeout(600)
+
+
+def wait_for_scan_login(page: Page, cfg: Config) -> None:
+    """等待微信扫码登录成功。"""
+    log("等待微信扫码登录...")
+    deadline = time.time() + cfg.login_timeout_sec
     last_hint = 0.0
+
     while time.time() < deadline:
         if "mooc.ctt.cn" in page.url:
             try:
-                if page.locator(
-                    "img[src*='avatar'], .user, .el-avatar, [class*='avatar'], [class*='user']"
-                ).first.is_visible(timeout=1200):
-                    log("检测到登录态，继续执行。")
-                    return
+                avatar_ok = page.locator("[class*='avatar'], [class*='user'], .el-avatar").first.is_visible(timeout=700)
             except Exception:
-                pass
+                avatar_ok = False
 
-            # 登录后若自动跳转到个人/课程页，也视为成功
-            if any(token in page.url for token in ("#/center", "#/train-new", "#/home")):
-                try:
-                    if page.locator("text=退出登录").first.is_visible(timeout=600):
-                        log("检测到登录态（退出按钮）。")
-                        return
-                except Exception:
-                    pass
-
-            # 兜底：如果页面已出现站内导航且用户头像区域可见，也认定为已登录
             try:
-                nav_ok = page.locator("text=首页").first.is_visible(timeout=600)
-                course_ok = page.locator("text=课程").first.is_visible(timeout=600)
-                user_ok = page.locator("[class*='user'], [class*='avatar'], .el-badge").first.is_visible(timeout=600)
-                if nav_ok and (course_ok or user_ok):
-                    log("检测到站内导航与用户区域，判定已登录。")
-                    return
+                nav_ok = page.locator("text=首页").first.is_visible(timeout=700)
+            except Exception:
+                nav_ok = False
+
+            body = ""
+            try:
+                body = safe_text(page.locator("body").inner_text())
             except Exception:
                 pass
 
-            # 再兜底：已在首页且没有扫码/登录弹窗关键词，默认继续
-            try:
-                body_text = safe_text(page.locator("body").inner_text())
-                on_home = "#/home" in page.url
-                has_login_prompt = any(x in body_text for x in ("扫码登录", "微信扫码", "手机号登录", "请登录"))
-                if on_home and not has_login_prompt:
-                    log("首页未发现登录弹窗，默认已登录并继续。")
-                    return
-            except Exception:
-                pass
+            has_login_prompt = any(k in body for k in ("扫码登录", "微信登录", "请登录", "APP扫码登录"))
+            if avatar_ok and nav_ok:
+                log("检测到头像与导航，登录成功。")
+                return
+            if nav_ok and not has_login_prompt:
+                log("已离开登录页并进入站内，判定登录成功。")
+                return
 
         now = time.time()
         if now - last_hint >= 15:
             last_hint = now
-            log("仍在等待登录识别：请确认已扫码并回到网站首页。")
-
+            log("仍在等待扫码完成，请使用微信扫码并在手机端确认登录。")
         time.sleep(1.5)
 
-    raise TimeoutError("等待扫码登录超时（10分钟）")
+    raise TimeoutError("等待扫码登录超时")
 
 
-def open_learning_center(page: Page) -> None:
-    log("进入学习中心页面...")
+def open_home_via_avatar(page: Page) -> None:
+    """登录后点击头像展开菜单，并进入学习中心/班级入口。"""
+    log("尝试点击头像并进入主页入口...")
+    if click_if_visible(page, ["[class*='avatar']", ".el-avatar", "img[src*='avatar']", "[class*='user']"], timeout=1500):
+        page.wait_for_timeout(900)
+
+    # 优先班级入口，再退化学习中心
+    if click_if_visible(
+        page,
+        [
+            "text=班级",
+            "a:has-text('班级')",
+            "button:has-text('班级')",
+            "text=学习中心",
+            "a:has-text('学习中心')",
+            "button:has-text('学习中心')",
+        ],
+        timeout=1500,
+    ):
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(1500)
+        return
+
     page.goto(CENTER_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(2200)
+    page.wait_for_timeout(1500)
 
 
-def click_first_unfinished_course(page: Page) -> bool:
-    """在当前页面点击第一个未完成课程卡片。"""
-    log("检索未完成课程...")
+def open_first_pending_class(page: Page, visited_classes: set[str]) -> bool:
+    """在当前页面查找一个未处理班级并进入。"""
+    log("查找需要学习的班级...")
 
-    # 优先点筛选“未完成”
-    for sel in ["text=未完成", "button:has-text('未完成')", ".el-tabs__item:has-text('未完成')"]:
-        try:
-            page.locator(sel).first.click(timeout=1200)
-            page.wait_for_timeout(800)
-            break
-        except Exception:
-            pass
+    # 常见入口：我的任务/班级列表
+    click_if_visible(page, ["text=我的任务", "text=班级", "text=学习中心"], timeout=800)
+    page.wait_for_timeout(800)
 
-    # 找到包含“未完成”的课程卡片
-    cards = page.locator("div,li,section,article").filter(has_text=re.compile(r"未完成"))
-    count = cards.count()
-    if count == 0:
-        log("没有发现未完成课程，任务结束。")
-        return False
-
-    for idx in range(count):
-        card = cards.nth(idx)
-        text = safe_text(card.inner_text())
-        if len(text) < 8:
+    class_nodes = page.locator("div,li,section,article,a").filter(has_text=re.compile(r"班"))
+    count = class_nodes.count()
+    for i in range(min(count, 120)):
+        node = class_nodes.nth(i)
+        text = safe_text(node.inner_text())
+        if len(text) < 4:
+            continue
+        key = text.replace("\n", " ")[:80]
+        if key in visited_classes:
+            continue
+        if not any(x in text for x in ("班", "课程", "任务")):
             continue
 
-        # 跳过工具栏和筛选区域
-        if text in ("未完成", "已完成", "全部"):
-            continue
-
-        for click_sel in [None, "a", "button", "img", ".cover", ".title"]:
+        for sel in [None, "a", "button", ".title", ".name"]:
             try:
-                target = card if click_sel is None else card.locator(click_sel).first
-                target.click(timeout=1500)
+                target = node if sel is None else node.locator(sel).first
+                target.click(timeout=1200)
                 page.wait_for_load_state("domcontentloaded")
-                page.wait_for_timeout(2000)
-                log(f"进入未完成课程：{text.replace(chr(10), ' / ')[:60]}")
+                page.wait_for_timeout(1500)
+                visited_classes.add(key)
+                log(f"进入班级：{key}")
                 return True
             except Exception:
                 continue
 
-    log("找到未完成课程，但未能进入。")
+    # 找不到班级时尝试直接进入学习中心（某些账号只有一个班级）
+    page.goto(CENTER_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1000)
     return False
 
 
+def find_unfinished_cards_on_current_page(page: Page):
+    return page.locator("div,li,section,article").filter(has_text=re.compile(r"未完成"))
+
+
+def goto_next_course_page(page: Page) -> bool:
+    """课程卡片分页：每页4个，自动翻下一页。"""
+    # 优先点击“> / 下一页”
+    for sel in [
+        "button:has-text('>')",
+        "a:has-text('>')",
+        "button:has-text('下一页')",
+        "a:has-text('下一页')",
+        "li:has-text('下一页')",
+    ]:
+        try:
+            btn = page.locator(sel).first
+            cls = safe_text(btn.get_attribute("class"))
+            if any(x in cls for x in ("disabled", "is-disabled")):
+                continue
+            btn.click(timeout=1200)
+            page.wait_for_timeout(1200)
+            log("已翻到下一页课程。")
+            return True
+        except Exception:
+            continue
+
+    # 兼容只有数字页码的情况：点击当前激活页码的下一个
+    try:
+        active = page.locator(".is-active, .active").first
+        active_txt = safe_text(active.inner_text())
+        if active_txt.isdigit():
+            next_no = str(int(active_txt) + 1)
+            if click_if_visible(page, [f"button:has-text('{next_no}')", f"a:has-text('{next_no}')", f"li:has-text('{next_no}')"], timeout=900):
+                page.wait_for_timeout(1200)
+                log(f"已翻到课程第 {next_no} 页。")
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def click_next_unfinished_course(page: Page, visited_courses: set[str]) -> bool:
+    """在当前班级内逐页查找未完成课程并点击进入。"""
+    # 优先筛选未完成
+    click_if_visible(page, ["text=未完成", "button:has-text('未完成')", "a:has-text('未完成')"], timeout=900)
+    page.wait_for_timeout(500)
+
+    while True:
+        cards = find_unfinished_cards_on_current_page(page)
+        count = cards.count()
+
+        for i in range(count):
+            card = cards.nth(i)
+            text = safe_text(card.inner_text())
+            if len(text) < 8:
+                continue
+            key = text.replace("\n", " ")[:120]
+            if key in visited_courses:
+                continue
+            if "未完成" not in text:
+                continue
+
+            for sel in [None, "a", "button", "img", ".cover", ".title"]:
+                try:
+                    target = card if sel is None else card.locator(sel).first
+                    target.click(timeout=1500)
+                    page.wait_for_load_state("domcontentloaded")
+                    page.wait_for_timeout(1500)
+                    visited_courses.add(key)
+                    log(f"进入未完成课程：{key[:60]}")
+                    return True
+                except Exception:
+                    continue
+
+        if not goto_next_course_page(page):
+            log("该班级内未找到更多未完成课程。")
+            return False
+
+
 def list_chapters(page: Page):
-    """读取右侧目录条目。"""
     candidates = [
         ".catalog *",
         ".directory *",
@@ -188,8 +296,9 @@ def list_chapters(page: Page):
             continue
         if cnt < 2:
             continue
+
         items = []
-        for i in range(min(cnt, 100)):
+        for i in range(min(cnt, 120)):
             node = nodes.nth(i)
             text = safe_text(node.inner_text())
             if not text:
@@ -198,11 +307,8 @@ def list_chapters(page: Page):
                 items.append((node, text))
         if len(items) >= 2:
             return items
+
     return []
-
-
-def is_quiz_chapter(text: str) -> bool:
-    return contains_keywords(text, QUIZ_KEYWORDS)
 
 
 def watch_current_video(page: Page, cfg: Config) -> bool:
@@ -237,25 +343,26 @@ def watch_current_video(page: Page, cfg: Config) -> bool:
 
 def process_course(page: Page, cfg: Config) -> None:
     page.wait_for_timeout(int(cfg.settle_wait_sec * 1000))
-
     chapters = list_chapters(page)
+
     if not chapters:
-        log("未识别到课程目录，返回学习中心。")
+        log("未识别到课程目录，返回班级课程页。")
         return
 
     for node, text in chapters:
         label = text.replace("\n", " / ")[:120]
         if "已完成" in text:
             continue
-        if is_quiz_chapter(text):
+        if contains_keywords(text, QUIZ_KEYWORDS):
             log(f"跳过答题类小节：{label}")
             continue
+
         if not contains_keywords(text, VIDEO_KEYWORDS) and not re.search(r"第[一二三四五六七八九十\d]+节", text):
             log(f"无法判断类型，默认尝试学习：{label}")
 
         try:
             node.click(timeout=1500)
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(1000)
         except Exception:
             continue
 
@@ -263,41 +370,55 @@ def process_course(page: Page, cfg: Config) -> None:
         watch_current_video(page, cfg)
 
 
-def back_to_center(page: Page) -> None:
-    for sel in ["text=返回", "text=学习中心", "text=我的学习", "a:has-text('返回')", "button:has-text('返回')"]:
-        try:
-            page.locator(sel).first.click(timeout=1200)
-            page.wait_for_timeout(1800)
-            return
-        except Exception:
-            pass
+def back_to_course_list(page: Page) -> None:
+    if click_if_visible(
+        page,
+        ["text=返回", "text=课程列表", "text=班级", "a:has-text('返回')", "button:has-text('返回')"],
+        timeout=1200,
+    ):
+        page.wait_for_timeout(1500)
+        return
 
-    page.goto(CENTER_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(1800)
+    page.go_back(wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
 
 
 def main() -> None:
     cfg = Config()
-
     with sync_playwright() as p:
         browser = launch_browser(p, cfg)
         context = browser.new_context()
         page = context.new_page()
 
         try:
-            wait_for_scan_login(page)
-            while True:
-                open_learning_center(page)
-                if not click_first_unfinished_course(page):
+            ensure_login_page_and_wechat_tab(page)
+            wait_for_scan_login(page, cfg)
+            open_home_via_avatar(page)
+
+            visited_classes: set[str] = set()
+            class_round = 0
+            while class_round < 20:
+                class_round += 1
+                if not open_first_pending_class(page, visited_classes):
+                    log("未找到可进入班级，结束。")
                     break
 
-                process_course(page, cfg)
-                back_to_center(page)
-                log("本轮课程处理完成，继续检查下一个未完成课程。")
+                visited_courses: set[str] = set()
+                course_round = 0
+                while course_round < 200:
+                    course_round += 1
+                    if not click_next_unfinished_course(page, visited_courses):
+                        break
+                    process_course(page, cfg)
+                    back_to_course_list(page)
 
-            log("全部课程处理结束。")
-        except PlaywrightTimeoutError as e:
-            log(f"页面操作超时: {e}")
+                page.goto(CENTER_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(1200)
+                log("班级处理完成，继续检查下一个班级。")
+
+            log("全部流程结束。")
+        except PlaywrightTimeoutError as exc:
+            log(f"页面操作超时：{exc}")
             raise
         finally:
             context.close()
