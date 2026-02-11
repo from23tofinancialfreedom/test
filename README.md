@@ -3,9 +3,9 @@
 自动化脚本示例：`auto_course.py`
 
 ## 功能
+- 默认使用 **Edge** 浏览器启动（如果 Edge 不可用会自动回退 Chromium）。
 - 打开 `https://mooc.ctt.cn/#/home` 并等待使用者扫码登录。
-- 登录后自动进入指定班级页面：
-  `https://mooc.ctt.cn/#/train-new/class-detail/7a803961-35aa-48e2-8f7b-5ea9796f8ffd`
+- 登录后自动进入学习中心：`https://mooc.ctt.cn/#/center/index`
 - 自动检索“未完成”课程并进入。
 - 自动遍历课程目录，优先学习视频类小节。
 - 识别到“测试/测验/练习/作业/考试/答题”等关键词的小节会直接跳过。
