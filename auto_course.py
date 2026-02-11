@@ -66,10 +66,13 @@ def wait_for_scan_login(page: Page) -> None:
     page.goto(HOME_URL, wait_until="domcontentloaded")
 
     deadline = time.time() + 10 * 60
+    last_hint = 0.0
     while time.time() < deadline:
         if "mooc.ctt.cn" in page.url:
             try:
-                if page.locator("img[src*='avatar'], .user, .el-avatar").first.is_visible(timeout=1200):
+                if page.locator(
+                    "img[src*='avatar'], .user, .el-avatar, [class*='avatar'], [class*='user']"
+                ).first.is_visible(timeout=1200):
                     log("检测到登录态，继续执行。")
                     return
             except Exception:
@@ -83,6 +86,33 @@ def wait_for_scan_login(page: Page) -> None:
                         return
                 except Exception:
                     pass
+
+            # 兜底：如果页面已出现站内导航且用户头像区域可见，也认定为已登录
+            try:
+                nav_ok = page.locator("text=首页").first.is_visible(timeout=600)
+                course_ok = page.locator("text=课程").first.is_visible(timeout=600)
+                user_ok = page.locator("[class*='user'], [class*='avatar'], .el-badge").first.is_visible(timeout=600)
+                if nav_ok and (course_ok or user_ok):
+                    log("检测到站内导航与用户区域，判定已登录。")
+                    return
+            except Exception:
+                pass
+
+            # 再兜底：已在首页且没有扫码/登录弹窗关键词，默认继续
+            try:
+                body_text = safe_text(page.locator("body").inner_text())
+                on_home = "#/home" in page.url
+                has_login_prompt = any(x in body_text for x in ("扫码登录", "微信扫码", "手机号登录", "请登录"))
+                if on_home and not has_login_prompt:
+                    log("首页未发现登录弹窗，默认已登录并继续。")
+                    return
+            except Exception:
+                pass
+
+        now = time.time()
+        if now - last_hint >= 15:
+            last_hint = now
+            log("仍在等待登录识别：请确认已扫码并回到网站首页。")
 
         time.sleep(1.5)
 
